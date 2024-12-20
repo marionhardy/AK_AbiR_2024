@@ -1,0 +1,663 @@
+---
+title: "AbiR + Olaparib treatment day 5 and 9: RNAseq summary"
+author: "Marion Hardy"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true 
+    theme: spacelab 
+    highlight: monochrome
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, cache = TRUE, echo = FALSE, warning = F, cache.lazy = F)
+knitr::opts_chunk$set(fig.width=10, fig.height=15) 
+
+library(tidyverse)
+library(DESeq2)
+library(cowplot)
+library(ggrepel)
+library(biomaRt)
+library(RColorBrewer)
+library(pheatmap)
+library(xlsx)
+library(msigdbr)
+library(clusterProfiler)
+library(kableExtra)
+
+```
+
+```{r Data loading, include=FALSE}
+
+dds = readRDS("./data_output/AbiR_DESeq.Rds")
+
+```
+
+# Introduction
+
+Abiraterone-resistant cancer cells (AbiR) were treated with:
+
+-   DMSO and harvested on day 3 = DMSO Day 3
+-   Olaparib 5 uM? and harvested on day 5 = Ola_5 Day 5
+-   Olaparib 5 uM? and harvested on day 9 = Ola_5 Day 9
+
+Was there a drug holiday in there? Need more context for this report.
+Bulk RNAseq, all samples collected on the same day.
+
+# Principal Component Analysis
+
+```{r, fig.height=7, fig.width=5}
+
+# Checking PCA
+
+rld = vst(dds)
+
+plotPCA(rld,intgroup="Condition")+
+  theme_bw() +
+  labs(title = 'PCA per condition')
+
+```
+
+Really good variance coverage by the first 2 components.
+No batch effect observed. Most of the variance is explained by DMSO vs Ola.
+
+# Euclidian Distance matrix
+
+```{r, fig.height=5, fig.width=6}
+
+# Checking sample similarity
+
+sampleDists = dist(t(assay(rld)))
+sampleDistMatrix = as.matrix(sampleDists)
+rownames(sampleDistMatrix) = paste(rld$Condition, sep="-")
+colnames(sampleDistMatrix) = paste(rld$Condition, sep="-")
+colors = colorRampPalette(rev(brewer.pal(9, "Blues")) )(255)
+
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+
+```
+
+# Comparaisons of interest
+## Picking comparisons based on AK's wishes
+
+```{r}
+resultsNames(dds) %>% 
+  knitr::kable()
+```
+
+Maybe
+- Ola day 5 vs DMSO
+- Ola day 9 vs DMSO
+
+## Olaparib day 5 vs DMSO
+
+```{r}
+
+res = results(dds, name = "Condition_Ola_Day_5_vs_DMSO")
+res_tbl = as_tibble(res, rownames="ensembl")
+
+# Import annotation file
+
+ensembl_to_geneName = readRDS("./data/hsapiens_annotations_230510.rds")
+
+# filter(!duplicated(gene, drop = F))
+
+# Add gene names and entrez id to your results
+
+res_tbl = res_tbl %>%
+  left_join(ensembl_to_geneName) %>%
+  arrange(padj) %>% 
+  distinct(ensembl, .keep_all = T)
+  
+
+write.csv(res_tbl,"./data_output/Ola_Day_5_vs_DMSO/res_tbl.csv", row.names = T)
+
+# Save the significant DEG in an excel file
+
+overexpr = res_tbl %>% filter(padj<=0.05 & log2FoldChange>=1) 
+underexpr = res_tbl %>% filter(padj<=0.05 & log2FoldChange<=-1)
+signif = full_join(overexpr, underexpr)
+
+write.xlsx(overexpr, file="./data_output/Ola_Day_5_vs_DMSO/Sign_genes.xlsx", sheetName="UP")
+write.xlsx(underexpr, file="./data_output/Ola_Day_5_vs_DMSO/Sign_genes.xlsx", sheetName="DOWN", append=TRUE)
+write.xlsx(signif, file="./data_output/Ola_Day_5_vs_DMSO/Sign_genes.xlsx", sheetName="SIGNIF", append=TRUE)
+
+```
+
+### Volcano plots
+
+```{r, fig.height=6, fig.width=14}
+# Volcano plot
+
+p1 =
+res_tbl %>%
+  filter(!is.na(padj)) %>%
+  ggplot(aes(x = log2FoldChange, y = -log10(padj),
+             color = padj < 0.05 & abs(log2FoldChange) > 1, 
+             label = ifelse(padj<0.05&log2FoldChange>=1|
+                              padj<0.05&log2FoldChange<=-1,as.character(gene),''))) +
+  scale_colour_manual(values = c("gray", "firebrick3")) +
+  labs(col="Significantly expressed")+
+  geom_point(size = 0.5) +
+  geom_hline(yintercept = -log10(0.05)) +
+  geom_vline(xintercept = 1) +
+  geom_vline(xintercept = -1)+
+  xlim(-7,9)+
+  geom_text_repel(max.overlaps = 5,
+                  box.padding = 0,
+                  segment.color = 'grey80',
+                  fontface = "italic")+
+  labs(title = "Ola_Day_5_vs_DMSO")+
+  theme_bw()
+
+print(p1)
+
+ggsave("./figures/Ola_Day_5_vs_DMSO/volcanoplot.png", last_plot(), 
+       dpi= 500, width = 14, height = 6)
+
+```
+
+### GSEA analysis (logFc)
+
+```{r}
+
+ordered_genes_fc = res_tbl$log2FoldChange
+names(ordered_genes_fc) = res_tbl$gene
+ordered_genes_fc = sort(ordered_genes_fc, decreasing = T)
+
+```
+
+```{r}
+
+# MsigDb
+
+hsa_GOBP_sets = msigdbr(
+  species = "Homo sapiens", 
+  category = "C5",
+  subcategory = "GO:BP")
+
+hsa_GOMF_sets = msigdbr(
+  species = "Homo sapiens", 
+  category = "C5",
+  subcategory = "GO:MF")
+
+hsa_reactome_sets = msigdbr(
+  species = "Homo sapiens", 
+  category = "C2",
+  subcategory = "CP:REACTOME") # for reactome collection
+
+hsa_kegg_sets = msigdbr(
+  species = "Homo sapiens", 
+  category = "C2",
+  subcategory = "CP:KEGG") # for KEGG collection
+
+hsa_wiki_sets = msigdbr(
+  species = "Homo sapiens", 
+  category = "C2",
+  subcategory = "CP:WIKIPATHWAYS") # for Wikipathways collection
+
+set.seed(054057) # for reproducibility
+
+```
+
+#### GOBP
+
+```{r, fig.height=9, fig.width=7}
+
+gsea_results = GSEA(
+  geneList = ordered_genes_fc, 
+  pvalueCutoff = 0.05, 
+  eps = 0, 
+  pAdjustMethod = "BH", 
+  nPermSimple = 10000,
+  TERM2GENE = dplyr::select(
+    hsa_GOBP_sets,
+    gs_name,
+    gene_symbol
+  )
+)
+
+dotplot(gsea_results, x = "NES", showCategory = 20, font.size = 6)+ 
+  labs(title = "GSEA",
+              subtitle = "GSEA GO:BP Ola day 5 vs DMSO")+
+   theme(axis.line = element_line(color='black'),
+    plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())+
+  xlim(-3.2,2.2)
+
+ggsave(plot = last_plot(), "./figures/Ola_Day_5_vs_DMSO/GOBPgsea.svg", dpi = 300,
+       height = 8, width = 8, device = "svg")
+
+write.xlsx(gsea_results, "./data_output/Ola_Day_5_vs_DMSO/GOBPgsea.xlsx")
+
+```
+
+```{r}
+gsea_results %>%
+  as_tibble() %>%
+  arrange(desc(NES)) %>% 
+  select(ID, NES, setSize,	p.adjust,	qvalue, core_enrichment) %>%
+  knitr::kable()%>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+  scroll_box(width = "1000px", height = "500px")
+```
+
+
+```{r, fig.height=9, fig.width=9}
+
+cnetplot(gsea_results, foldChange=ordered_genes_fc, showCategory = 30,
+         cex_label_category = .5, cex_label_gene = .5, layout = 'fr')+
+  scale_colour_gradient2(name = "fold change", 
+                         low = "blue", 
+                         mid = "white", 
+                         high = "red")
+
+```
+
+#### GOMF
+
+```{r, fig.height=9, fig.width=7}
+
+gsea_results = GSEA(
+  geneList = ordered_genes_fc, 
+  pvalueCutoff = 0.05, 
+  eps = 0, 
+  pAdjustMethod = "BH", 
+  nPermSimple = 10000,
+  TERM2GENE = dplyr::select(
+    hsa_GOMF_sets,
+    gs_name,
+    gene_symbol
+  )
+)
+
+dotplot(gsea_results, x = "NES", showCategory = 30, font.size = 7)+ 
+  labs(title = "GSEA",
+              subtitle = "GSEA GO:MF Ola day 5 vs DMSO")+
+   theme(axis.line = element_line(color='black'),
+    plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())+
+  xlim(-3.2,2.2)
+
+ggsave(plot = last_plot(), "./figures/Ola_Day_5_vs_DMSO/GOMFgsea.svg", dpi = 300,
+       height = 8, width = 8, device = "svg")
+
+write.xlsx(gsea_results, "./data_output/Ola_Day_5_vs_DMSO/GOMFgsea.xlsx")
+
+```
+
+```{r}
+gsea_results %>%
+  as_tibble() %>%
+  arrange(desc(NES)) %>% 
+  select(ID, NES, setSize,	p.adjust,	qvalue, core_enrichment) %>%
+  knitr::kable()%>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+  scroll_box(width = "1000px", height = "500px")
+```
+
+```{r, fig.height=15, fig.width=15}
+
+cnetplot(gsea_results, foldChange=ordered_genes_fc, showCategory = 30,
+         cex_label_category = .5, cex_label_gene = .5, layout = 'fr')+
+  scale_colour_gradient2(name = "fold change", 
+                         low = "blue", 
+                         mid = "white", 
+                         high = "red")
+```
+
+#### Reactome
+
+```{r, fig.height=8, fig.width=7}
+
+gsea_results = GSEA(
+  geneList = ordered_genes_fc, 
+  pvalueCutoff = 0.05, 
+  eps = 0, 
+  pAdjustMethod = "BH", 
+  nPermSimple = 10000,
+  TERM2GENE = dplyr::select(
+    hsa_reactome_sets,
+    gs_name,
+    gene_symbol
+  )
+)
+
+dotplot(gsea_results, x = "NES", showCategory = 30, font.size = 7)+ 
+  labs(title = "GSEA",
+              subtitle = "GSEA Reactome Ola day 5 vs DMSO")+
+   theme(axis.line = element_line(color='black'),
+    plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())+
+  xlim(-3.2,2.2)
+
+ggsave(plot = last_plot(), "./figures/Ola_Day_5_vs_DMSO/Reactomegsea.svg", dpi = 300, height = 8, width = 8, device = "svg")
+
+write.xlsx(gsea_results, "./data_output/Ola_Day_5_vs_DMSO/Reactomegsea.xlsx")
+
+```
+
+```{r}
+gsea_results %>%
+  as_tibble() %>%
+  arrange(desc(NES)) %>% 
+  select(ID, NES, setSize,	p.adjust,	qvalue, core_enrichment) %>%
+  knitr::kable()%>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+  scroll_box(width = "1000px", height = "500px")
+```
+
+```{r, fig.height=15, fig.width=15}
+
+cnetplot(gsea_results, foldChange=ordered_genes_fc, showCategory = 30,
+         cex_label_category = .5, cex_label_gene = .5, layout = 'fr')+
+  scale_colour_gradient2(name = "fold change", 
+                         low = "blue", 
+                         mid = "white", 
+                         high = "red")
+```
+
+#### Wikipathways
+
+```{r, fig.height=8, fig.width=7}
+
+gsea_results = GSEA(
+  geneList = ordered_genes_fc, 
+  pvalueCutoff = 0.05, 
+  eps = 0, 
+  pAdjustMethod = "BH", 
+  nPermSimple = 10000,
+  TERM2GENE = dplyr::select(
+    hsa_wiki_sets,
+    gs_name,
+    gene_symbol
+  )
+)
+
+dotplot(gsea_results, x = "NES", showCategory = 30, font.size = 7)+ 
+  labs(title = "GSEA",
+              subtitle = "GSEA Wikipathways Ola day 5 vs DMSO")+
+   theme(axis.line = element_line(color='black'),
+    plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())+
+  xlim(-3.2,2.2)
+
+ggsave(plot = last_plot(), "./figures/Ola_Day_5_vs_DMSO/wikigsea.svg", dpi = 300,
+       height = 8, width = 8, device = "svg")
+
+write.xlsx(gsea_results, "./data_output/Ola_Day_5_vs_DMSO/wikigsea.xlsx")
+
+```
+
+```{r}
+gsea_results %>%
+  as_tibble() %>%
+  arrange(desc(NES)) %>% 
+  select(ID, NES, setSize,	p.adjust,	qvalue, core_enrichment) %>%
+  knitr::kable()%>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+  scroll_box(width = "1000px", height = "500px")
+```
+
+```{r, fig.height=15, fig.width=15}
+
+cnetplot(gsea_results, foldChange=ordered_genes_fc, showCategory = 30,
+         cex_label_category = .5, cex_label_gene = .5, layout = 'fr')+
+  scale_colour_gradient2(name = "fold change", 
+                         low = "blue", 
+                         mid = "white", 
+                         high = "red")
+```
+
+## Olaparib day 9 vs day 5
+
+This will give you the differences between the two. Otherwise they are way to similar for you to be able to manually go through the minute changes.
+
+```{r}
+
+dds$Condition = relevel(dds$Condition, "Ola_Day_5")
+dds = DESeq(dds)
+resultsNames(dds)
+
+res = results(dds, name = "Condition_Ola_Day_9_vs_Ola_Day_5")
+res_tbl = as_tibble(res, rownames="ensembl")
+
+# Add gene names and entrez id to your results
+
+res_tbl = res_tbl %>%
+  left_join(ensembl_to_geneName) %>%
+  arrange(padj) %>% 
+  distinct(ensembl, .keep_all = T)
+  
+
+write.csv(res_tbl,"./data_output/Ola_Day_9_vs_Ola_Day_5/res_tbl.csv", row.names = T)
+
+# Save the significant DEG in an excel file
+
+overexpr = res_tbl %>% filter(padj<=0.05 & log2FoldChange>=1) 
+underexpr = res_tbl %>% filter(padj<=0.05 & log2FoldChange<=-1)
+signif = full_join(overexpr, underexpr)
+
+write.xlsx(overexpr, file="./data_output/Ola_Day_9_vs_Ola_Day_5/Sign_genes.xlsx", sheetName="UP")
+write.xlsx(underexpr, file="./data_output/Ola_Day_9_vs_Ola_Day_5/Sign_genes.xlsx", sheetName="DOWN", append=TRUE)
+write.xlsx(signif, file="./data_output/Ola_Day_9_vs_Ola_Day_5/Sign_genes.xlsx", sheetName="SIGNIF", append=TRUE)
+
+```
+
+### Volcano plots
+
+```{r, fig.height=6, fig.width=14}
+# Volcano plot
+
+p1 =
+res_tbl %>%
+  filter(!is.na(padj)) %>%
+  ggplot(aes(x = log2FoldChange, y = -log10(padj),
+             color = padj < 0.05 & abs(log2FoldChange) > 1, 
+             label = ifelse(padj<0.05&log2FoldChange>=1|
+                              padj<0.05&log2FoldChange<=-1,as.character(gene),''))) +
+  scale_colour_manual(values = c("gray", "firebrick3")) +
+  labs(col="Significantly expressed")+
+  geom_point(size = 0.5) +
+  geom_hline(yintercept = -log10(0.05)) +
+  geom_vline(xintercept = 1) +
+  geom_vline(xintercept = -1)+
+  xlim(-7,9)+
+  geom_text_repel(max.overlaps = 5,
+                  box.padding = 0,
+                  segment.color = 'grey80',
+                  fontface = "italic")+
+  labs(title = "Ola_Day_9_vs_Ola_Day_5")+
+  theme_bw()
+
+print(p1)
+
+ggsave("./figures/Ola_Day_9_vs_Ola_Day_5/volcanoplot.png", last_plot(), 
+       dpi= 500, width = 7, height = 6)
+
+```
+
+### GSEA analysis (logFc)
+
+```{r}
+
+ordered_genes_fc = res_tbl$log2FoldChange
+names(ordered_genes_fc) = res_tbl$gene
+ordered_genes_fc = sort(ordered_genes_fc, decreasing = T)
+
+```
+
+#### GOBP
+
+```{r, fig.height=9, fig.width=7}
+
+gsea_results = GSEA(
+  geneList = ordered_genes_fc, 
+  pvalueCutoff = 0.05, 
+  eps = 0, 
+  pAdjustMethod = "BH", 
+  nPermSimple = 10000,
+  TERM2GENE = dplyr::select(
+    hsa_GOBP_sets,
+    gs_name,
+    gene_symbol
+  )
+)
+
+dotplot(gsea_results, x = "NES", showCategory = 20, font.size = 6)+ 
+  labs(title = "GSEA",
+              subtitle = "GSEA GO:BP Ola day 9 vs day 5")+
+   theme(axis.line = element_line(color='black'),
+    plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())+
+  xlim(-3.2,2.2)
+
+ggsave(plot = last_plot(), "./figures/Ola_Day_9_vs_Ola_Day_5/GOBPgsea.svg", dpi = 300,
+       height = 8, width = 8, device = "svg")
+
+write.xlsx(gsea_results, "./data_output/Ola_Day_9_vs_Ola_Day_5/GOBPgsea.xlsx")
+
+```
+
+```{r}
+gsea_results %>%
+  as_tibble() %>%
+  arrange(desc(NES)) %>% 
+  select(ID, NES, setSize,	p.adjust,	qvalue, core_enrichment) %>%
+  knitr::kable()%>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+  scroll_box(width = "1000px", height = "500px")
+```
+
+
+```{r, fig.height=9, fig.width=9}
+
+cnetplot(gsea_results, foldChange=ordered_genes_fc, showCategory = 30,
+         cex_label_category = .5, cex_label_gene = .5, layout = 'fr')+
+  scale_colour_gradient2(name = "fold change", 
+                         low = "blue", 
+                         mid = "white", 
+                         high = "red")
+
+```
+
+#### GOMF
+
+```{r, fig.height=9, fig.width=7}
+
+gsea_results = GSEA(
+  geneList = ordered_genes_fc, 
+  pvalueCutoff = 0.05, 
+  eps = 0, 
+  pAdjustMethod = "BH", 
+  nPermSimple = 10000,
+  TERM2GENE = dplyr::select(
+    hsa_GOMF_sets,
+    gs_name,
+    gene_symbol
+  )
+)
+
+dotplot(gsea_results, x = "NES", showCategory = 30, font.size = 7)+ 
+  labs(title = "GSEA",
+              subtitle = "GSEA GO:MF Ola day 9 vs day 5")+
+   theme(axis.line = element_line(color='black'),
+    plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())+
+  xlim(-3.2,2.2)
+
+ggsave(plot = last_plot(), "./figures/Ola_Day_9_vs_Ola_Day_5/GOMFgsea.svg", dpi = 300,
+       height = 8, width = 8, device = "svg")
+
+write.xlsx(gsea_results, "./data_output/Ola_Day_9_vs_Ola_Day_5/GOMFgsea.xlsx")
+
+```
+
+```{r}
+gsea_results %>%
+  as_tibble() %>%
+  arrange(desc(NES)) %>% 
+  select(ID, NES, setSize,	p.adjust,	qvalue, core_enrichment) %>%
+  knitr::kable()%>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+  scroll_box(width = "1000px", height = "500px")
+```
+
+```{r, fig.height=15, fig.width=15}
+
+cnetplot(gsea_results, foldChange=ordered_genes_fc, showCategory = 30,
+         cex_label_category = .5, cex_label_gene = .5, layout = 'fr')+
+  scale_colour_gradient2(name = "fold change", 
+                         low = "blue", 
+                         mid = "white", 
+                         high = "red")
+```
+
+#### Reactome
+
+```{r, fig.height=8, fig.width=7}
+
+gsea_results = GSEA(
+  geneList = ordered_genes_fc, 
+  pvalueCutoff = 0.05, 
+  eps = 0, 
+  pAdjustMethod = "BH", 
+  nPermSimple = 10000,
+  TERM2GENE = dplyr::select(
+    hsa_reactome_sets,
+    gs_name,
+    gene_symbol
+  )
+)
+
+dotplot(gsea_results, x = "NES", showCategory = 30, font.size = 7)+ 
+  labs(title = "GSEA",
+              subtitle = "GSEA Reactome Ola day 9 vs day 5")+
+   theme(axis.line = element_line(color='black'),
+    plot.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank())+
+  xlim(-3.2,2.2)
+
+ggsave(plot = last_plot(), "./figures/Ola_Day_9_vs_Ola_Day_5/Reactomegsea.svg", dpi = 300, height = 8, width = 8, device = "svg")
+
+write.xlsx(gsea_results, "./data_output/Ola_Day_9_vs_Ola_Day_5/Reactomegsea.xlsx")
+
+```
+
+```{r}
+gsea_results %>%
+  as_tibble() %>%
+  arrange(desc(NES)) %>% 
+  select(ID, NES, setSize,	p.adjust,	qvalue, core_enrichment) %>%
+  knitr::kable()%>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>% 
+  scroll_box(width = "1000px", height = "500px")
+```
+
+```{r, fig.height=15, fig.width=15}
+
+cnetplot(gsea_results, foldChange=ordered_genes_fc, showCategory = 30,
+         cex_label_category = .5, cex_label_gene = .5, layout = 'fr')+
+  scale_colour_gradient2(name = "fold change", 
+                         low = "blue", 
+                         mid = "white", 
+                         high = "red")
+```
+
+```{r}
+sessionInfo()
+```
